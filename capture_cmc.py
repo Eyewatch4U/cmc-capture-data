@@ -270,6 +270,15 @@ def post_to_worker(snapshot: dict) -> int:
         headers={
             "Content-Type": "application/json",
             "x-sync-token": SYNC_TOKEN,
+            # Cloudflare bloquea el UA por defecto de urllib (Python-urllib/…) con
+            # el error 1010 ("browser signature banned"). Con un UA de navegador
+            # normal la request pasa el firewall del Worker.
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
         },
         method="POST",
     )
