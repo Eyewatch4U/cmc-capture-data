@@ -1,0 +1,68 @@
+name: Capture CMC
+
+# Captura el snapshot de Meltwater (CMC Panamá) e INGESTA el JSON al
+# Cloudflare Worker del Monitor CMC.
+# Repo PUBLICO -> minutos de Actions ilimitados y gratis.
+# Disparo: cron-job.org POST a workflow_dispatch cada 30 min.
+#   https://api.github.com/repos/Eyewatch4U/cmc-capture-data/actions/workflows/capture.yml/dispatches
+#
+# Cadena: Actions (Playwright baja y valida el .gz)
+#           -> POST del JSON a cmcmonitor/ingest con x-sync-token
+#           -> Worker procesa y escribe KV (latest_cmc en CMC/MONITOR)
+#           -> Dashboard /monitor-cmc
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cmc-capture
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Capturar e ingestar al Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Playwright + Chromium
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Ejecutar capture
+        env:
+          MELTWATER_URL:      ${{ secrets.MELTWATER_URL }}
+          MELTWATER_PASSWORD: ${{ secrets.MELTWATER_PASSWORD }}
+          WORKER_INGEST_URL:  ${{ secrets.WORKER_INGEST_URL }}
+          SYNC_TOKEN:         ${{ secrets.SYNC_TOKEN }}
+          MAX_WAIT_SECONDS:   '300'
+          JITTER_SECONDS:     '0'
+        run: |
+          mkdir -p debug_output
+          python capture_cmc.py 2>&1 | tee debug_output/full_log.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Subir debug como artifact (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: debug_output/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Resultado
+        if: always()
+        run: echo "Ejecución finalizada a las $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
