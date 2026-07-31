@@ -1,0 +1,47 @@
+name: Capture CMC (debug)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Instalar Playwright + Chromium
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+      - name: Ejecutar capture (captura log siempre)
+        id: cap
+        continue-on-error: true
+        env:
+          MELTWATER_URL:      ${{ secrets.MELTWATER_URL }}
+          MELTWATER_PASSWORD: ${{ secrets.MELTWATER_PASSWORD }}
+          WORKER_INGEST_URL:  ${{ secrets.WORKER_INGEST_URL }}
+          SYNC_TOKEN:         ${{ secrets.SYNC_TOKEN }}
+          MAX_WAIT_SECONDS:   '300'
+        run: |
+          mkdir -p debug_output
+          set +e
+          python capture_cmc.py 2>&1 | tee debug_output/full_log.txt
+          echo "EXIT_CODE=${PIPESTATUS[0]}" >> debug_output/full_log.txt
+      - name: Publicar log en el repo (rama debug-logs)
+        if: always()
+        run: |
+          git config user.name "capture-bot"
+          git config user.email "bot@eyewatch.me"
+          mkdir -p _debug
+          cp debug_output/full_log.txt _debug/last_run.txt || echo "sin log" > _debug/last_run.txt
+          # tomar solo las últimas 120 líneas para que sea legible
+          tail -120 debug_output/full_log.txt > _debug/last_run_tail.txt 2>/dev/null || true
+          git add -f _debug/last_run.txt _debug/last_run_tail.txt
+          git commit -m "debug: log del capture $(date -u +%FT%TZ)" || echo "sin cambios"
+          git push origin HEAD:main || echo "push falló"
