@@ -1,32 +1,20 @@
 """
-Meltwater Auto-Capture — CMC (Panamá)
-=======================================
-Captura el snapshot del shareable report de Meltwater (LATAM) y lo INGESTA
-directamente al Cloudflare Worker del Monitor CMC.
+Meltwater Auto-Capture CMC (GitHub Actions Edition)
+==================================================
+Igual que el bookmarklet manual, PERO ahora valida el contenido:
+  1. Abre la página de Meltwater en Chrome real
+  2. Ingresa la contraseña si aparece el prompt
+  3. Espera a que la página haga sus XHR
+  4. Captura la URL .json.gz fresca del Network tab
+  5. *** BAJA el .gz, lo descomprime y verifica que trae datos reales ***
+     - Si viene vacío (snapshot regenerándose) => reload y reintenta
+     - Solo si hay señal > 0 hace el POST a Make.com
+  6. POST de esa URL al webhook de Make.com → fin
 
-Flujo:
-  1. Abre la página de Meltwater en Chromium real (Playwright).
-  2. Pasa el password gate (Web Component flux-textfield#passcode).
-  3. ESPERA a que Meltwater dispare la URL `insightPageSnapshot.json.gz`.
-     No recarga en loop: cada reload REINICIA la generación del snapshot.
-  4. Baja el .gz, lo descomprime y valida que traiga datos reales (señal > 0).
-  5. POSTea el JSON completo a WORKER_INGEST_URL con el header x-sync-token.
-
-Por qué /ingest y no /update-url (ni Make):
-  Meltwater devuelve 502 a IPs de datacenter. Los datacenters de Cloudflare y
-  de Make entran en esa categoría, así que si el que baja el .gz es el Worker
-  (o Make), el fetch contra Meltwater falla y el KV nunca se actualiza.
-  Con /ingest, Cloudflare nunca toca Meltwater: el runner de GitHub ya baja el
-  .gz de todas formas (para validar la señal), así que mandar el JSON en vez de
-  la URL no cuesta nada extra y elimina el bloqueo.
-
-Validación de señal:
-  Meltwater puede servir el .gz con la estructura completa (insightPage.tabs)
-  pero con las agregaciones en CERO mientras regenera. compute_signal() recorre
-  tabs -> rows -> cards -> fragments sumando hits/totals/counts. Si da 0, NO se
-  ingesta, para no pisar 'latest_cmc' con un snapshot vacío.
-
-El debug queda en debug_output/ y el workflow lo sube como artifact privado.
+Motivo del cambio: Meltwater a veces sirve el insightPageSnapshot.json.gz con
+la estructura completa (insightPage.tabs) pero las agregaciones en CERO mientras
+regenera el snapshot. La versión anterior solo chequeaba status 200 y mandaba la
+URL igual, por lo que el worker guardaba un snapshot vacío y pisaba 'latest'.
 """
 
 import asyncio
@@ -34,50 +22,35 @@ import os
 import sys
 import json
 import gzip
-import time
-import random
 import urllib.request
 import traceback
 from pathlib import Path
-from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
+MELTWATER_URL = os.environ["MELTWATER_URL"]
+MELTWATER_PASSWORD = os.environ.get("MELTWATER_PASSWORD", "")
+MAKE_WEBHOOK = os.environ["MAKE_WEBHOOK_URL"]
 
-# ── Config (todo por entorno; sin secretos hardcodeados) ─────────────────────
-def _req(name: str) -> str:
-    val = os.environ.get(name)
-    if not val:
-        sys.exit(f"FALTA el secret/env requerido: {name}")
-    return val
-
-
-MELTWATER_URL = _req("MELTWATER_URL")
-MELTWATER_PASSWORD = os.environ.get("MELTWATER_PASSWORD", "")  # vacío si no hay gate
-WORKER_INGEST_URL = _req("WORKER_INGEST_URL")
-SYNC_TOKEN = _req("SYNC_TOKEN")
-
-# Tiempos
-MAX_WAIT_SECONDS = int(os.environ.get("MAX_WAIT_SECONDS", "300"))
-POLL_INTERVAL_MS = int(os.environ.get("POLL_INTERVAL_MS", "5000"))
-STALL_RELOAD_SECONDS = int(os.environ.get("STALL_RELOAD_SECONDS", "120"))
-JITTER_SECONDS = int(os.environ.get("JITTER_SECONDS", "0"))
-HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
-
-# Proxy opcional (NO requerido). Ej: http://user:pass@host:port
-PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+# Cuántos reloads extra hacemos si el .gz aparece pero viene VACÍO
+MAX_VALIDATE_RELOADS = int(os.environ.get("MAX_VALIDATE_RELOADS", "4"))
 
 DEBUG_DIR = Path("debug_output")
 DEBUG_DIR.mkdir(exist_ok=True)
 
 
 def compute_signal(data: dict) -> int:
-    """Suma de 'señal' recorriendo tabs/rows/cards/fragments. 0 = snapshot vacío."""
+    """
+    Suma de 'señal' de datos reales recorriendo tabs/rows/cards/fragments.
+    Si da 0, el snapshot llegó sin agregaciones (vacío / regenerándose).
+    Refleja exactamente lo que hace que el worker guarde un snapshot vacío.
+    """
     ip = (data or {}).get("insightPage") or {}
+    tabs = ip.get("tabs") or []
     signal = 0
-    for t in ip.get("tabs") or []:
-        for row in t.get("rows") or []:
-            for card in row.get("cards") or []:
-                for frag in card.get("fragments") or []:
+    for t in tabs:
+        for row in (t.get("rows") or []):
+            for card in (row.get("cards") or []):
+                for frag in (card.get("fragments") or []):
                     d = frag.get("data") or {}
                     hits = d.get("hits")
                     if isinstance(hits, list):
@@ -86,56 +59,42 @@ def compute_signal(data: dict) -> int:
                     if isinstance(tot, (int, float)):
                         signal += tot
                     date = (d.get("aggs") or {}).get("date") or {}
-                    for v in date.get("values") or []:
-                        signal += (v.get("counts") or {}).get("doc") or 0
+                    for v in (date.get("values") or []):
+                        signal += ((v.get("counts") or {}).get("doc") or 0)
     return signal
 
 
-async def fetch_gz(page, url: str):
-    """Baja el .gz en la misma sesión, descomprime y devuelve (data, signal, size)."""
+async def fetch_gz_signal(page, url: str):
+    """Baja el .gz (en la misma sesión), descomprime y devuelve (signal, size_bytes)."""
     resp = await page.request.get(url, timeout=45_000)
     if not resp.ok:
-        print(f"  GET gz status {resp.status}", flush=True)
-        return None, -1, 0
+        print(f"  ⚠ GET gz status {resp.status}", flush=True)
+        return -1, 0
     body = await resp.body()
     size = len(body)
+    # Descomprimir si es gzip (magic 1f 8b). Si Playwright ya lo decodificó, usar tal cual.
     if len(body) >= 2 and body[0] == 0x1F and body[1] == 0x8B:
         try:
             body = gzip.decompress(body)
         except Exception as e:
-            print(f"  gzip.decompress fallo: {e}", flush=True)
-            return None, -1, size
+            print(f"  ⚠ gzip.decompress falló: {e}", flush=True)
+            return -1, size
     try:
         data = json.loads(body.decode("utf-8", errors="replace"))
     except Exception as e:
-        print(f"  json.loads fallo: {e}", flush=True)
-        return None, -1, size
-    return data, compute_signal(data), size
+        print(f"  ⚠ json.loads falló: {e}", flush=True)
+        return -1, size
+    return compute_signal(data), size
 
 
-def _proxy_kwargs():
-    if not PROXY_URL:
-        return {}
-    p = urlparse(PROXY_URL)
-    server = f"{p.scheme}://{p.hostname}" + (f":{p.port}" if p.port else "")
-    proxy = {"server": server}
-    if p.username:
-        proxy["username"] = p.username
-    if p.password:
-        proxy["password"] = p.password
-    print(f"→ Usando proxy: {server}", flush=True)
-    return {"proxy": proxy}
-
-
-async def capture_snapshot() -> dict:
-    """Devuelve el JSON del snapshot ya validado (señal > 0)."""
-    gz = {"url": None}
-    snapshot_statuses = []
-    all_responses = []
+async def capture_gz_url() -> str:
+    """Abre Meltwater, ingresa el password, captura la URL .gz y VALIDA su contenido."""
+    gz_url_holder = {"url": None}
+    all_responses = []  # Para diagnóstico
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=HEADLESS,
+            headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
@@ -151,34 +110,39 @@ async def capture_snapshot() -> dict:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
-            extra_http_headers={"Accept-Language": "es-ES,es;q=0.9,en;q=0.8"},
-            **_proxy_kwargs(),
+            extra_http_headers={
+                "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            },
         )
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
+
         page = await context.new_page()
 
         def on_response(response):
-            url, st = response.url, response.status
-            all_responses.append(f"{st} {url[:160]}")
-            if "snapshot" in url:
-                snapshot_statuses.append(f"{st} {url[:120]}")
-            if "insightPageSnapshot.json.gz" in url and st == 200:
-                gz["url"] = url
-                print("✓ URL .gz detectada", flush=True)
+            all_responses.append(f"{response.status} {response.url[:120]}")
+            if "insightPageSnapshot.json.gz" in response.url and response.status == 200:
+                gz_url_holder["url"] = response.url
+                print(f"✓ URL .gz capturada", flush=True)
 
         page.on("response", on_response)
 
-        print("→ Navegando a Meltwater...", flush=True)
+        print(f"→ Navegando a Meltwater...", flush=True)
         await page.goto(MELTWATER_URL, wait_until="domcontentloaded", timeout=60_000)
         print(f"  page.url = {page.url}", flush=True)
         print(f"  page.title = {await page.title()}", flush=True)
 
-        # ── Password gate (Web Component flux-textfield#passcode) ────────────
+        print(f"→ Esperando UI (password gate o reporte)...", flush=True)
+        passcode_present = False
         try:
             await page.wait_for_selector("#passcode", timeout=20_000, state="attached")
-            print("→ Password gate detectado, enviando passcode...", flush=True)
+            passcode_present = True
+        except Exception:
+            passcode_present = False
+
+        if passcode_present:
+            print(f"→ Página de password detectada (flux-textfield#passcode)", flush=True)
             await page.wait_for_function(
                 "() => document.getElementById('passcode') && "
                 "document.getElementById('submit') && "
@@ -194,120 +158,109 @@ async def capture_snapshot() -> dict:
                 }""",
                 MELTWATER_PASSWORD,
             )
-            await page.wait_for_load_state("domcontentloaded", timeout=30_000)
-            await page.wait_for_timeout(2_000)
-            print(f"  Post-reload: {await page.title()}", flush=True)
-        except Exception:
-            print("→ Sin password gate (¿ya autenticado o reporte abierto?)", flush=True)
+            print(f"→ Password enviado. Esperando reload...", flush=True)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                await page.wait_for_timeout(2_000)
+                print(f"  Post-reload: {await page.title()}", flush=True)
+            except Exception as e:
+                print(f"  ⚠ wait post-reload: {e}", flush=True)
+        else:
+            print(f"→ Sin página de password (¿ya autenticado?)", flush=True)
 
+        print(f"→ Esperando network idle + XHR...", flush=True)
         try:
-            await page.wait_for_load_state("networkidle", timeout=30_000)
-        except Exception:
-            pass
+            await page.wait_for_load_state("networkidle", timeout=45_000)
+        except Exception as e:
+            print(f"  ⚠ networkidle timeout: {e}", flush=True)
+        await page.wait_for_timeout(8_000)
 
-        # ── LOOP DE ESPERA (NO reload agresivo) ──────────────────────────────
-        print(f"→ Esperando .gz (hasta {MAX_WAIT_SECONDS}s, sin recargas agresivas)...", flush=True)
-        deadline = time.time() + MAX_WAIT_SECONDS
-        last_reload = time.time()
-        validated = None
-
-        while time.time() < deadline:
-            if gz["url"]:
-                data, signal, size = await fetch_gz(page, gz["url"])
-                print(f"  señal={signal}  size={size}B", flush=True)
-                if signal > 0:
-                    validated = data
-                    print(f"✓ Snapshot CON datos (señal={signal}).", flush=True)
-                    break
-                print("⚠ Snapshot vacío (regenerando). Sigo esperando un .gz nuevo...", flush=True)
-                gz["url"] = None
-
-            if (time.time() - last_reload) > STALL_RELOAD_SECONDS:
-                rem = int(deadline - time.time())
-                print(f"→ Stall > {STALL_RELOAD_SECONDS}s. Reload suave único. (quedan {rem}s)", flush=True)
+        # ── LOOP CAPTURA + VALIDACIÓN ────────────────────────────────────────
+        # Reintenta si: (a) no apareció la URL .gz, o (b) apareció pero VINO VACÍA.
+        validated_url = None
+        for attempt in range(0, MAX_VALIDATE_RELOADS + 1):
+            # ¿ya tenemos URL? si no, forzar un reload (salvo el primer intento que ya esperó)
+            if not gz_url_holder["url"]:
+                if attempt == 0:
+                    # primer intento sin url -> dar una vuelta de reload
+                    pass
+                print(f"→ .gz no capturado. Reload {attempt + 1}/{MAX_VALIDATE_RELOADS + 1}...", flush=True)
                 try:
                     await page.reload(wait_until="domcontentloaded", timeout=45_000)
-                    await page.wait_for_load_state("networkidle", timeout=30_000)
+                    await page.wait_for_load_state("networkidle", timeout=45_000)
                 except Exception:
                     pass
-                last_reload = time.time()
+                await page.wait_for_timeout(8_000)
+                if not gz_url_holder["url"]:
+                    continue
 
-            await page.wait_for_timeout(POLL_INTERVAL_MS)
+            # tenemos URL -> validar contenido
+            url = gz_url_holder["url"]
+            print(f"→ Validando contenido del .gz (intento {attempt + 1})...", flush=True)
+            signal, size = await fetch_gz_signal(page, url)
+            print(f"  señal={signal}  size={size}B", flush=True)
 
-        # ── Debug -> debug_output/ (el workflow lo sube como artifact) ───────
-        try:
-            await page.screenshot(path=str(DEBUG_DIR / "final.png"))
-        except Exception:
-            pass
-        try:
-            (DEBUG_DIR / "page.html").write_text((await page.content())[:50_000])
-        except Exception:
-            pass
+            if signal > 0:
+                validated_url = url
+                print(f"✓ Snapshot CON datos (señal={signal}).", flush=True)
+                break
+
+            # vacío -> forzar regeneración con reload y volver a capturar
+            print(f"⚠ Snapshot VACÍO (señal={signal}). Reload para forzar gz nuevo...", flush=True)
+            gz_url_holder["url"] = None
+            if attempt < MAX_VALIDATE_RELOADS:
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=45_000)
+                    await page.wait_for_load_state("networkidle", timeout=45_000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(8_000)
+
+        # Diagnóstico
+        await page.screenshot(path=str(DEBUG_DIR / "final.png"))
+        html = await page.content()
+        (DEBUG_DIR / "page.html").write_text(html[:50_000])
         (DEBUG_DIR / "responses.txt").write_text("\n".join(all_responses))
-        (DEBUG_DIR / "snapshot_statuses.txt").write_text("\n".join(snapshot_statuses))
 
         await browser.close()
 
-    if validated is None:
-        diag = "\n".join(snapshot_statuses[-10:]) or "(sin requests a /snapshot)"
+    if not gz_url_holder["url"] and not validated_url:
         raise RuntimeError(
-            f"No se obtuvo un .gz con datos en {MAX_WAIT_SECONDS}s tras "
-            f"{len(all_responses)} responses.\n"
-            f"Últimos estados del endpoint snapshot:\n{diag}\n"
-            f"502 persistente = Meltwater bloquea la IP de salida (datacenter)."
+            f"No se capturó URL .gz después de {len(all_responses)} responses. "
+            f"Ver debug_output/ para detalles."
         )
-    return validated
+    if not validated_url:
+        raise RuntimeError(
+            f"Se capturó la URL .gz pero SIEMPRE vino VACÍA tras "
+            f"{MAX_VALIDATE_RELOADS + 1} intentos (snapshot regenerándose). "
+            f"NO se envía a Make para no pisar 'latest'."
+        )
+    return validated_url
 
 
-def post_to_worker(snapshot: dict) -> int:
-    """POSTea el JSON completo al endpoint /ingest del Worker."""
-    print("→ POST a Cloudflare Worker (/ingest)...", flush=True)
-    payload = json.dumps(snapshot).encode("utf-8")
-    print(f"  payload: {len(payload)} bytes", flush=True)
+def post_to_make(gz_url: str) -> int:
+    print(f"→ POST a Make.com...", flush=True)
+    payload = json.dumps({"url": gz_url, "sync": True}).encode("utf-8")
     req = urllib.request.Request(
-        WORKER_INGEST_URL,
+        MAKE_WEBHOOK,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-sync-token": SYNC_TOKEN,
-            # Cloudflare bloquea el UA por defecto de urllib (Python-urllib/…) con
-            # el error 1010 ("browser signature banned"). Con un UA de navegador
-            # normal la request pasa el firewall del Worker.
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-        },
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = resp.read().decode("utf-8", errors="replace")[:400]
-            print(f"✓ Worker respondió {resp.status}: {body}", flush=True)
-            return resp.status
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:400]
-        print(f"✗ Worker respondió {e.code}: {body}", flush=True)
-        # 422 = capture vacío (el Worker protege 'latest'); 401 = token mal.
-        raise RuntimeError(f"Worker devolvió {e.code}: {body}")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        status = resp.status
+        body = resp.read().decode("utf-8", errors="replace")[:200]
+        print(f"✓ Make.com respondió {status}: {body}", flush=True)
+        return status
 
 
 async def main():
     try:
-        if JITTER_SECONDS > 0:
-            d = random.randint(0, JITTER_SECONDS)
-            print(f"→ Jitter: durmiendo {d}s antes de arrancar...", flush=True)
-            await asyncio.sleep(d)
-
-        snapshot = await capture_snapshot()
-        status = post_to_worker(snapshot)
+        gz_url = await capture_gz_url()
+        status = post_to_make(gz_url)
         if status not in (200, 202):
-            sys.exit(f"Worker devolvió status inesperado: {status}")
+            sys.exit(f"Make.com devolvió status inesperado: {status}")
         print("✓ Pipeline completo OK.", flush=True)
-    except SystemExit:
-        raise
     except Exception as e:
         print(f"\n✗ ERROR: {e}", flush=True)
         traceback.print_exc()
