@@ -1,14 +1,14 @@
 name: Capture CMC
 
-# Captura el snapshot de Meltwater (CMC Panamá) e INGESTA el JSON al
-# Cloudflare Worker del Monitor CMC.
+# Replica exacta del patrón BR-capture-data (BROU), que corre en producción.
 # Repo PUBLICO -> minutos de Actions ilimitados y gratis.
-# Disparo: cron-job.org POST a workflow_dispatch cada 30 min.
+# Disparo: cron-job.org POST a workflow_dispatch cada 15-30 min.
 #   https://api.github.com/repos/Eyewatch4U/cmc-capture-data/actions/workflows/capture.yml/dispatches
 #
-# Cadena: Actions (Playwright baja y valida el .gz)
-#           -> POST del JSON a cmcmonitor/ingest con x-sync-token
-#           -> Worker procesa y escribe KV (latest_cmc en CMC/MONITOR)
+# Cadena: Actions (Playwright captura la URL del .gz)
+#           -> POST {url, sync:true} al webhook de Make (CMC-DATA)
+#           -> Make: HTTP POST a cmcmonitor/ingest con x-sync-token
+#           -> Worker baja el .gz, procesa y escribe KV (latest_cmc en CMC/MONITOR)
 #           -> Dashboard /monitor-cmc
 
 on:
@@ -23,9 +23,9 @@ permissions:
 
 jobs:
   capture:
-    name: Capturar e ingestar al Worker
+    name: Capturar y enviar a Make.com
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repo
@@ -38,17 +38,14 @@ jobs:
 
       - name: Instalar Playwright + Chromium
         run: |
-          pip install -r requirements.txt
+          pip install playwright==1.47.0
           playwright install chromium --with-deps
 
       - name: Ejecutar capture
         env:
           MELTWATER_URL:      ${{ secrets.MELTWATER_URL }}
           MELTWATER_PASSWORD: ${{ secrets.MELTWATER_PASSWORD }}
-          WORKER_INGEST_URL:  ${{ secrets.WORKER_INGEST_URL }}
-          SYNC_TOKEN:         ${{ secrets.SYNC_TOKEN }}
-          MAX_WAIT_SECONDS:   '300'
-          JITTER_SECONDS:     '0'
+          MAKE_WEBHOOK_URL:   ${{ secrets.MAKE_WEBHOOK_URL }}
         run: |
           mkdir -p debug_output
           python capture_cmc.py 2>&1 | tee debug_output/full_log.txt
